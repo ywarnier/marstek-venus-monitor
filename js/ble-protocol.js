@@ -234,6 +234,7 @@ let otaChunkSize = 132;       // Default, calculated from MTU
 let pendingAckResolve = null;
 let firmwareChecksum = 0;
 let firmwareData = null;
+let firmwareType = 'Unknown';
 
 // ========================================
 // WEB BLUETOOTH CLEANUP HELPERS (Chrome)
@@ -1174,7 +1175,7 @@ function analyzeFirmware(firmwareArrayBuffer) {
     sum = sum >>> 0; // Convert to unsigned 32-bit
     const checksum = (~sum) >>> 0; // Ones' complement and convert to unsigned 32-bit
 
-    // Detect firmware type by searching for VenusC signature anywhere in binary
+    // Detect firmware type (see the 0x3333 trailer note below)
     let firmwareType = 'Unknown';
     let sizeWarning = '';
     let versionInfo = null;
@@ -1197,34 +1198,40 @@ function analyzeFirmware(firmwareArrayBuffer) {
         }
     }
 
-    if (venusOffset !== -1) {
-        // EMS/Control firmware - found VenusC signature
-        firmwareType = 'EMS/Control Firmware';
+    // BMS images end with a 0x3333 trailer. That trailer is the discriminator:
+    // it is present in all 13 BMS images in the firmware archive and absent from
+    // all 19 EMS/Control images.
+    //
+    // Do NOT infer the type from "VenusC". It is not a signature - the firmware
+    // selects between the literals "VenusC"/"VenusE"/"Venus" by device type to
+    // build the version string it reports over BLE. It is absent from 16 of the
+    // 19 archive Control images, and its offset moves every build (0xe004 ->
+    // 0x10898 -> 0x10c3c -> 0x113c4 across v153-v156), so its absence says
+    // nothing about firmware type. It is used below only for version extraction.
+    const hasBmsTrailer = bytes.length >= 2 &&
+        bytes[bytes.length - 2] === 0x33 &&
+        bytes[bytes.length - 1] === 0x33;
 
-        // Extract version string (VenusC-xxx format)
-        let versionEnd = venusOffset;
-        while (versionEnd < bytes.length && bytes[versionEnd] !== 0) {
-            versionEnd++;
-        }
-        const versionBytes = bytes.slice(venusOffset, Math.min(versionEnd, venusOffset + 32));
-        const versionStr = new TextDecoder('utf-8', { fatal: false }).decode(versionBytes);
-
-        // Try to extract version, build date, and build time from ARM instructions
-        versionInfo = extractVersionInfo(bytes, venusOffset);
-        if (versionInfo) {
-            firmwareType = `EMS/Control Firmware v${versionInfo.version}`;
-        }
-
-        log(`   VenusC signature found at offset 0x${venusOffset.toString(16)}`);
-    } else if (bytes.length >= 32768) {
-        // No VenusC signature - likely BMS firmware
-        firmwareType = 'BMS Firmware';
-    } else if (bytes.length >= 1024) {
-        firmwareType = 'Unknown (small size - proceed with caution)';
-        sizeWarning = 'File size is unusually small for firmware';
-    } else {
+    if (bytes.length < 1024) {
         firmwareType = 'Unknown (very small - likely not firmware)';
         sizeWarning = 'File size is very small - this may not be valid firmware';
+    } else if (bytes.length < 32768) {
+        firmwareType = 'Unknown (small size - proceed with caution)';
+        sizeWarning = 'File size is unusually small for firmware';
+    } else if (hasBmsTrailer) {
+        firmwareType = 'BMS Firmware';
+        log(`   BMS trailer (0x3333) found at end of binary`);
+    } else {
+        firmwareType = 'EMS/Control Firmware';
+
+        if (venusOffset !== -1) {
+            // Try to extract version, build date, and build time from ARM instructions
+            versionInfo = extractVersionInfo(bytes, venusOffset);
+            if (versionInfo) {
+                firmwareType = `EMS/Control Firmware v${versionInfo.version}`;
+            }
+            log(`   VenusC model string found at offset 0x${venusOffset.toString(16)}`);
+        }
     }
 
     log(`Firmware analysis:`);
@@ -1786,6 +1793,7 @@ async function connectAndPrepareOTA() {
     // Analyze firmware: checksum + type detection
     const analysis = analyzeFirmware(firmwareData);
     firmwareChecksum = analysis.checksum;
+    firmwareType = analysis.type;
     log(`🔑 Firmware ready for upload`);
 }
 
@@ -2035,10 +2043,11 @@ async function sendOTAFinalize() {
             const dir = ack.payload.length >= 1 ? `0x${ack.payload[0].toString(16)}` : 'none';
             const status = ack.payload.length >= 2 ? `0x${ack.payload[1].toString(16)}` : 'none';
             log(`OTA finalization FAILED - dir: ${dir}, status: ${status}`);
-            log(`Possible causes of status=0x00 failure:`);
-            log(`  1. CRC mismatch - device calculated checksum differs from sent checksum`);
-            log(`  2. VenusC check failed - device firmware checks for "Venu" at fixed offset 0xE004`);
-            log(`     Note: If currently running firmware has VenusC at different offset, this check fails`);
+            log(`The device rejected the image. Known causes:`);
+            log(`  1. CRC mismatch - the device's checksum differs from the one we sent`);
+            log(`  2. Wrong image for this device - e.g. another model's firmware, or a`);
+            log(`     BMS/EMS mismatch with the type flag sent in the 0x3A handshake`);
+            log(`Detected firmware type: ${firmwareType}`);
             log(`Sent checksum: 0x${(firmwareChecksum >>> 0).toString(16).padStart(8, '0')}`);
             return false;
         }
@@ -2098,10 +2107,17 @@ async function performOTAUpdate() {
         
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                // OTA init payload: position 7 in frame becomes byte_2000E941 (OTA type flag)
-                // Setting byte_2000E941 = 0 makes finalize v1 check pass without firmware signature dependency
-                // Payload positions: [DIR, word_lo, word_hi, byte_2000E941, reserved, reserved]
-                const otaProbeFrame = buildOtaFrame(0x3A, new Uint8Array([0x10, 0xd7, 0x00, 0x00, 0xaa, 0xbb]));
+                // OTA type flag, sent as the 4th payload byte of the 0x3A handshake.
+                // Confirmed against a BLE capture of the official app flashing a BMS
+                // image, which sends payload 10 d7 00 03 aa bb and then finalizes
+                // successfully. Sending 0x00 for a BMS image makes finalize (0x52)
+                // return status 0x00. What the device does with the flag internally
+                // is not established - only that BMS images require 0x03.
+                const otaTypeFlag = firmwareType.includes('BMS') ? 0x03 : 0x00;
+                log(`🔧 DEBUG: Firmware type: ${firmwareType}, setting OTA type flag to 0x${otaTypeFlag.toString(16).padStart(2, '0')}`);
+                
+                // Payload positions: [DIR, word_lo, word_hi, type flag, reserved, reserved]
+                const otaProbeFrame = buildOtaFrame(0x3A, new Uint8Array([0x10, 0xd7, 0x00, otaTypeFlag, 0xaa, 0xbb]));
                 logOutgoing(otaProbeFrame, `OTA Discovery Probe (0x3A) - Attempt ${attempt}/${maxRetries}`);
                 log(`🔧 DEBUG: Sending 0x3A probe to characteristic FF01 (write), expecting response on FF02 (notify)`);
                 await txCharacteristic.writeValueWithoutResponse(otaProbeFrame);
