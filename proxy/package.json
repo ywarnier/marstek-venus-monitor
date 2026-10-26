@@ -1,0 +1,12 @@
+{
+  "name": "marstek-udp-bridge",
+  "version": "1.0.0",
+  "description": "WebSocket-to-UDP bridge for Marstek LAN connectivity",
+  "main": "udp-bridge.js",
+  "scripts": {
+    "start": "node udp-bridge.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
