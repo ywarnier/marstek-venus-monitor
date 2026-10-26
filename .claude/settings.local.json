@@ -4,7 +4,10 @@
       "Bash(mkdir:*)",
       "mcp__ida-pro-mcp__check_connection",
       "mcp__ida-pro-mcp__get_function_by_address",
-      "mcp__ida-pro-mcp__decompile_function"
+      "mcp__ida-pro-mcp__decompile_function",
+      "WebSearch",
+      "WebFetch(domain:static-eu.marstekcloud.com)",
+      "WebFetch(domain:github.com)"
     ],
     "deny": []
   }
